@@ -23,7 +23,6 @@ warnings.filterwarnings(
 
 config = {"CONFIG_FILE_PATH": "./config.cfg"}
 
-
 def load_config():
     """
     Loads configuration file into module variables.
@@ -152,7 +151,7 @@ def moved_objects_insert_stream():
     print("Starting BQ insert stream...")
     for row in moved_objects:
         batch.append(row)
-        if len(batch) > BATCH_SIZE:
+        if len(batch) > config["BQ_BATCH_WRITE_SIZE"]:
             try:
                 insert_errors.append(bq.insert_rows_json(moved_objects_table, batch))
             except BadRequest as e:

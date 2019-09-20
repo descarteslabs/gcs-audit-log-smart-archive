@@ -104,7 +104,7 @@ step_set_up_cloud_function:
 	@$(CHECK_CONTINUE) 
 	@echo
 	# make topic
-	gcloud pubsub topics create $(SCHEDULING_TOPIC)
+	#gcloud pubsub topics create $(SCHEDULING_TOPIC)
 	# deploy function
 	gcloud functions deploy $(FUNCTION_NAME) --entry-point=archive_cold_objects --runtime python37 --trigger-topic $(SCHEDULING_TOPIC) --timeout 540s --memory $(FUNCTION_MEMORY) --max-instances 1
 	@$(call MESSAGE, Success! Run make again to deploy new code or configuration.)
