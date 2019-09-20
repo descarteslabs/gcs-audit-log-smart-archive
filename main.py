@@ -163,6 +163,7 @@ def moved_objects_insert_stream():
         if len(batch) > config["BQ_BATCH_WRITE_SIZE"]:
             print("Flushing BQ insert batch.")
             try:
+                #XXX: this could OOM if BQ is having a bad day
                 insert_errors.append(bq.insert_rows_json(moved_objects_table, batch))
             except BadRequest as e:
                 if not e.message.endswith("No rows present in the request."):
