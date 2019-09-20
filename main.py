@@ -152,6 +152,7 @@ def moved_objects_insert_stream():
     for row in moved_objects:
         batch.append(row)
         if len(batch) > config["BQ_BATCH_WRITE_SIZE"]:
+            print("Flushing BQ insert batch.")
             try:
                 insert_errors.append(bq.insert_rows_json(moved_objects_table, batch))
             except BadRequest as e:
