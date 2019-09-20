@@ -2,6 +2,7 @@
 import warnings
 from atexit import register
 from atexit import unregister
+import concurrent.futures
 from concurrent.futures import as_completed
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -16,12 +17,11 @@ from google.cloud import bigquery
 from google.cloud import storage
 
 warnings.filterwarnings(
-    "ignore", "Your application has authenticated using end user credentials")
+    "ignore", "Your application has authenticated using end user credentials"
+)
 
 
-config = {
-    "CONFIG_FILE_PATH": "./config.cfg"
-}
+config = {"CONFIG_FILE_PATH": "./config.cfg"}
 
 
 def load_config():
@@ -31,23 +31,19 @@ def load_config():
     config_file = open(config["CONFIG_FILE_PATH"], "r")
     for line in config_file:
         # ignore comments
-        if line.startswith('#'):
+        if line.startswith("#"):
             continue
         # parse the line
-        tokens = line.split('=')
+        tokens = line.split("=")
         if len(tokens) != 2:
             print("Error parsing config tokens: %s" % tokens)
             continue
         k, v = tokens
         config[k.strip()] = v.strip()
     # quick validation
-    for required in [
-        'PROJECT',
-        'DATASET_NAME',
-        'DAYS_THRESHOLD',
-            'NEW_STORAGE_CLASS']:
+    for required in ["PROJECT", "DATASET_NAME", "DAYS_THRESHOLD", "NEW_STORAGE_CLASS"]:
         if required not in config.keys() or config[required] is "CONFIGURE_ME":
-            print('Missing required config item: {}'.format(required))
+            print("Missing required config item: {}".format(required))
             exit(1)
 
 
@@ -64,7 +60,8 @@ def initialize_moved_objects_table():
     bq = get_bq_client()
 
     moved_objects_table = "`{}.{}.objects_moved_to_{}`".format(
-        config['PROJECT'], config['DATASET_NAME'], config['NEW_STORAGE_CLASS'])
+        config["PROJECT"], config["DATASET_NAME"], config["NEW_STORAGE_CLASS"]
+    )
 
     querytext = """
         CREATE TABLE IF NOT EXISTS {} (
@@ -72,7 +69,8 @@ def initialize_moved_objects_table():
             size INT64,
             archiveTimestamp TIMESTAMP
         )""".format(
-        moved_objects_table)
+        moved_objects_table
+    )
 
     query_job = bq.query(querytext)
     return query_job.result()
@@ -93,10 +91,12 @@ def query_access_table():
     bq = get_bq_client()
 
     access_log_tables = "`{}.{}.cloudaudit_googleapis_com_data_access_*`".format(
-        config['PROJECT'], config['DATASET_NAME'])
+        config["PROJECT"], config["DATASET_NAME"]
+    )
 
     moved_objects_table = "`{}.{}.objects_moved_to_{}`".format(
-        config['PROJECT'], config['DATASET_NAME'], config['NEW_STORAGE_CLASS'])
+        config["PROJECT"], config["DATASET_NAME"], config["NEW_STORAGE_CLASS"]
+    )
 
     querytext = """
     SELECT a.resourceName, lastAccess FROM (
@@ -106,7 +106,9 @@ def query_access_table():
     AS a 
     LEFT JOIN {1} as b ON a.resourceName = b.resourceName
     WHERE b.resourceName IS NULL
-""".format(access_log_tables, moved_objects_table)
+""".format(
+        access_log_tables, moved_objects_table
+    )
     query_job = bq.query(querytext)
     return query_job.result()
 
@@ -142,17 +144,25 @@ def moved_objects_insert_stream():
 
     # TODO: configurable?
     moved_objects_table = "{}.{}.objects_moved_to_{}".format(
-        config['PROJECT'], config['DATASET_NAME'], config['NEW_STORAGE_CLASS'])
+        config["PROJECT"], config["DATASET_NAME"], config["NEW_STORAGE_CLASS"]
+    )
 
     insert_errors = []
+    batch = []
     print("Starting BQ insert stream...")
-    try:
-        insert_errors = bq.insert_rows_json(moved_objects_table, moved_objects)
-    except BadRequest as e:
-        if not e.message.endswith("No rows present in the request."):
-            raise e
+    for row in moved_objects:
+        batch.append(row)
+        if len(batch) > BATCH_SIZE:
+            try:
+                insert_errors.append(bq.insert_rows_json(moved_objects_table, batch))
+            except BadRequest as e:
+                if not e.message.endswith("No rows present in the request."):
+                    raise e
+            finally:
+                batch.clear()
+
     print("Finished BQ insert stream...")
-    return ("BQ Errors:\t{}".format(insert_errors))
+    return "BQ Errors:\t{}".format(insert_errors)
 
 
 def evaluate_objects(audit_log):
@@ -170,20 +180,27 @@ def evaluate_objects(audit_log):
         try:
             blob = storage.blob.Blob(object_name, bucket)
             blob.update_storage_class(config['NEW_STORAGE_CLASS'])
-            output.append("\tRewrote {} to: {}".format(
-                object_path, config['NEW_STORAGE_CLASS']))
+            output.append(
+                "\tRewrote {} to: {}".format(object_path, config["NEW_STORAGE_CLASS"])
+            )
             moved_objects.put(
                 {
                     "resourceName": row.resourceName,
                     "size": blob.size,
-                    "archiveTimestamp": str(datetime.now(timezone.utc))
-                }, True)
+                    "archiveTimestamp": str(datetime.now(timezone.utc)),
+                },
+                True,
+            )
             output.append(
-                "\tStreaming {} object archive status to BQ.".format(object_path))
+                "\tStreaming {} object archive status to BQ.".format(object_path)
+            )
         except NotFound:
-            output.append("Skipping {} :: this object seems to have been deleted.".format(
-                object_path))
-        return '\n'.join(output)
+            output.append(
+                "Skipping {} :: this object seems to have been deleted.".format(
+                    object_path
+                )
+            )
+        return "\n".join(output)
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         # start BQ stream
@@ -195,25 +212,50 @@ def evaluate_objects(audit_log):
             moved_objects.close()
             executor.shutdown()
             print(stream_future.result())
+
         # shutdown hook for cleanup in case we get a sigterm
         register(cleanup)
 
+        row_counter = 0
         # evaluate, archive and record
         for row in audit_log:
+            row_counter += 1
             timedelta = datetime.now(tz=timezone.utc) - row.lastAccess
             bucket_name, object_name = get_bucket_and_object(row.resourceName)
             object_path = "/".join(["gs:/", bucket_name, object_name])
 
-            if timedelta.days >= int(config['DAYS_THRESHOLD']):
-                print(object_path, "last accessed {} ago, greater than {} days(s) ago".format(
-                    timedelta, config['DAYS_THRESHOLD']))
+            if timedelta.days >= int(config["DAYS_THRESHOLD"]):
+                print(
+                    object_path,
+                    "last accessed {} ago, greater than {} days(s) ago".format(
+                        timedelta, config["DAYS_THRESHOLD"]
+                    ),
+                )
                 archive_futures.append(
-                    executor.submit(_archive_object, row, bucket_name,
-                                    object_name, object_path))
+                    executor.submit(
+                        _archive_object, row, bucket_name, object_name, object_path
+                    )
+                )
             else:
-                print(object_path, "last accessed {} ago, less than {} days(s) ago".format(
-                    timedelta, config['DAYS_THRESHOLD']))
-        # print results as they come
+                print(
+                    object_path,
+                    "last accessed {} ago, less than {} days(s) ago".format(
+                        timedelta, config["DAYS_THRESHOLD"]
+                    ),
+                )
+
+            # check for results periodically as we go
+            if row_counter > 100:
+                row_counter = 0
+
+                try:
+                    for f in as_completed(archive_futures, timeout=0.05):
+                        print(f.result())
+                        archive_futures.remove(f)
+                except concurrent.futures.TimeoutError:
+                    continue
+
+        # print remaining results as they complete
         for f in as_completed(archive_futures):
             print(f.result())
 
@@ -245,10 +287,10 @@ def get_bq_client():
     Returns:
         google.cloud.bigquery.Client -- A BigQuery client.
     """
-    if 'bq' not in clients:
+    if "bq" not in clients:
         bq = bigquery.Client()
-        clients['bq'] = bq
-    return clients['bq']
+        clients["bq"] = bq
+    return clients["bq"]
 
 
 def get_gcs_client():
@@ -257,10 +299,10 @@ def get_gcs_client():
     Returns:
         google.cloud.storage.Client -- A GCS client.
     """
-    if 'gcs' not in clients:
+    if "gcs" not in clients:
         gcs = storage.Client()
-        clients['gcs'] = gcs
-    return clients['gcs']
+        clients["gcs"] = gcs
+    return clients["gcs"]
 
 
 def event_is_fresh(data, context):
@@ -287,8 +329,11 @@ def event_is_fresh(data, context):
     # TODO: Should this be configurable?
     max_age_ms = 10000
     if event_age_ms > max_age_ms:
-        print('Event timeout. Dropping {} (age {}ms)'.format(
-            context.event_id, event_age_ms))
+        print(
+            "Event timeout. Dropping {} (age {}ms)".format(
+                context.event_id, event_age_ms
+            )
+        )
         return False
     return True
 
@@ -301,11 +346,14 @@ def archive_cold_objects(data, context):
         initialize_moved_objects_table()
         print("Getting access log, except for already moved objects.")
         audit_log = query_access_table()
-        print("Evaluating accessed objects for rewriting to {}.".format(
-            config['NEW_STORAGE_CLASS']))
+        print(
+            "Evaluating accessed objects for rewriting to {}.".format(
+                config["NEW_STORAGE_CLASS"]
+            )
+        )
         evaluate_objects(audit_log)
         print("Done.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     archive_cold_objects(None, None)
