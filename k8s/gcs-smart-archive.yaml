@@ -5,7 +5,8 @@ metadata:
   name: gcs-smart-archive
 spec:
   concurrencyPolicy: Forbid
-  schedule: "* */8 * * *"
+  # 10 am MST
+  schedule: "0 16 * * *"
   jobTemplate:
     spec:
       template:
