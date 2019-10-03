@@ -9,9 +9,6 @@ IMAGE = us.gcr.io/${PROJECT}/${NAME}
 TF_CMD  = cd deployment/terraform && terraform
 TF_VARS = -var name=$(NAME) -var image=$(IMAGE):${VERSION} 
 
-secrets             := $(shell find secrets -type f -not -name "*.enc" -not -name ".*")
-encrypted_secrets	  := $(wildcard secrets/*.enc)
-
 # change this as needed
 .DEFAULT_GOAL		:= help
 
