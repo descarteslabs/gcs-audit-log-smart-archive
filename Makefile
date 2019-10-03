@@ -1,5 +1,5 @@
 NAME    = $(shell basename $(CURDIR))
-VERSION = 0.0.1
+VERSION = 0.0.2
 PROJECT = automatapolis
 KEYRING = automation-prod
 KEY	    = k8s-secrets

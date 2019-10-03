@@ -144,6 +144,7 @@ def query_access_table():
     WHERE b.resourceName IS NULL AND c.resourceName IS NULL
     """.format(access_log_tables, moved_objects_table, excluded_objects_table)
     query_job = bq.query(querytext)
+    print(f"Access table query job ID: {query_job.job_id}")
     return query_job.result()
 
 

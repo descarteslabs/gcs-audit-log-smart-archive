@@ -29,5 +29,5 @@ spec:
             value: workload_identity
           containers:
           - name: gcs-smart-archive
-            image: us.gcr.io/automatapolis/gcs-audit-log-smart-archive:0.0.1
+            image: us.gcr.io/automatapolis/gcs-audit-log-smart-archive:0.0.2
             imagePullPolicy: Always
