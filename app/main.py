@@ -2,6 +2,7 @@
 import argparse
 import logging
 import warnings
+from atexit import register
 from threading import Thread
 from datetime import datetime, timezone
 from os import getenv
@@ -34,13 +35,15 @@ def get_moved_objects_output(config):
         concurrent.futures.TimeoutError –- If the job did not complete in the
         given timeout.
     """
-    moved_objects_table = "{}.{}.objects_moved_to_{}".format(
+    moved_objects_table = "{}.{}.objects_moved".format(
         config["BQ_JOB_PROJECT"] if "BQ_JOB_PROJECT" in config else
-        config["PROJECT"], config['DATASET_NAME'], config['NEW_STORAGE_CLASS'])
+        config["PROJECT"], config['DATASET_NAME'])
     schema = """
             resourceName STRING, 
+            storageClass STRING,
             size INT64,
-            archiveTimestamp TIMESTAMP
+            blobCreatedTimeWhenMoved TIMESTAMP,
+            moveTimestamp TIMESTAMP
         """
     return BigQueryOutput(config, moved_objects_table, schema)
 
@@ -58,7 +61,7 @@ def get_excluded_objects_output(config):
         concurrent.futures.TimeoutError –- If the job did not complete in the
         given timeout.
     """
-    excluded_objects_table = "{}.{}.objects_excluded_from_archive".format(
+    excluded_objects_table = "{}.{}.objects_excluded".format(
         config["BQ_JOB_PROJECT"] if "BQ_JOB_PROJECT" in config else
         config["PROJECT"], config['DATASET_NAME'])
     schema = "resourceName STRING"
@@ -79,111 +82,190 @@ def query_access_table(config):
         google.cloud.exceptions.GoogleCloudError – If the job failed.
         concurrent.futures.TimeoutError – If the job did not complete in the given timeout.
     """
-    LOG.info(
-        "Getting last access of all objects, where last access is older than the DAYS_THRESHOLD, without already moved and excluded objects."
-    )
+    LOG.info("Getting access history.")
 
     bqc = get_bq_client(config)
 
     access_log_tables = "`{}.{}.cloudaudit_googleapis_com_data_access_*`".format(
         config['PROJECT'], config['DATASET_NAME'])
 
-    moved_objects_table = "`{}.{}.objects_moved_to_{}`".format(
-        config['PROJECT'], config['DATASET_NAME'], config['NEW_STORAGE_CLASS'])
-
-    excluded_objects_table = "`{}.{}.objects_excluded_from_archive`".format(
+    moved_objects_table = "`{}.{}.objects_moved`".format(
         config['PROJECT'], config['DATASET_NAME'])
 
+    excluded_objects_table = "`{}.{}.objects_excluded`".format(
+        config['PROJECT'], config['DATASET_NAME'])
+
+    catch_up_union = ""
+    if 'CATCHUP_TABLE' in config:
+        catchup_table = "`{}.{}.{}`".format(config['PROJECT'],
+                                            config['DATASET_NAME'],
+                                            config['CATCHUP_TABLE'])
+        catch_up_union = """
+            UNION ALL
+            SELECT
+                REGEXP_REPLACE(url,"gs://(.*)/(.*)","projects/_/buckets/{1}1/objects/{1}2") AS resourceName,
+                created AS timestamp
+            FROM
+                {0}
+        """.format(catchup_table, "\\\\")
+
     querytext = """
-    SELECT a.resourceName, lastAccess FROM (
-        SELECT REGEXP_REPLACE(protopayload_auditlog.resourceName, "gs://.*/", "") AS resourceName,
-        MAX(timestamp) AS lastAccess FROM {0}
-        WHERE
-            _TABLE_SUFFIX BETWEEN 
-            FORMAT_DATE("%Y%m%d", DATE_SUB(CURRENT_DATE(), INTERVAL {3} DAY)) AND
-            FORMAT_DATE("%Y%m%d", CURRENT_DATE())
-        GROUP BY resourceName) 
-    AS a 
-    LEFT JOIN {1} as b ON a.resourceName = b.resourceName
-    LEFT JOIN {2} as c ON a.resourceName = c.resourceName
-    WHERE b.resourceName IS NULL AND c.resourceName IS NULL AND
-    TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), lastAccess, DAY) >= {4}
-    """.format(access_log_tables, moved_objects_table, excluded_objects_table,
-               int(config["DAYS_THRESHOLD"]) + int(config["DAYS_BETWEEN_RUNS"]),
-               int(config["DAYS_THRESHOLD"]))
+WITH 
+most_recent_moves AS (SELECT
+    z.*
+FROM
+    {1} AS z
+INNER JOIN (
+    SELECT
+        resourceName as object,
+        MAX(moveTimestamp) as most_recent
+    FROM
+        {1}
+    GROUP BY resourceName) as y on y.most_recent = z.moveTimestamp)
+,
+access_records AS (SELECT
+    REGEXP_REPLACE(protopayload_auditlog.resourceName, "gs://.*/", "") AS resourceName,
+    timestamp
+  FROM {0}
+  WHERE
+    _TABLE_SUFFIX BETWEEN FORMAT_DATE("%Y%m%d", DATE_SUB(CURRENT_DATE(), INTERVAL {3} DAY))
+    AND FORMAT_DATE("%Y%m%d", CURRENT_DATE())
+  {5}
+)
+
+SELECT a.resourceName, b.storageClass, lastAccess, recent_access_count FROM (
+    SELECT resourceName,
+    MAX(timestamp) AS lastAccess,
+    COUNTIF(TIMESTAMP_DIFF(CURRENT_TIMESTAMP(), timestamp, DAY) <= {4}) AS recent_access_count
+    FROM access_records
+    GROUP BY resourceName)
+AS a 
+LEFT JOIN most_recent_moves as b ON a.resourceName = b.resourceName
+LEFT JOIN {2} as c ON a.resourceName = c.resourceName
+WHERE c.resourceName IS NULL
+    """.format(
+        access_log_tables, moved_objects_table, excluded_objects_table,
+        int(config["COLD_THRESHOLD_DAYS"]) + int(config["DAYS_BETWEEN_RUNS"]),
+        int(config['WARM_THRESHOLD_DAYS']), catch_up_union)
     LOG.debug("Query: %s", querytext)
     query_job = bqc.query(querytext)
     return query_job.result()
 
 
-def should_archive(timedelta, object_path, config):
-    """Decide whether an object should be archived.
+def should_warm_up(row, config):
+    """Decide whether an object should be rewritten to a "warmer" storage class.
 
     Arguments:
-        timedelta {datetime.timedelta} -- Time since last access of the object.
-        object_path {string} -- Full gs:// path to the object
+        row {BigQuery.row} -- Row from result set.
         config {dict} -- Configuration of this program.
 
     Returns:
         bool -- True if the object should be archived.
     """
+    bucket_name, object_name = get_bucket_and_object(row.resourceName)
+    object_path = "/".join(["gs:/", bucket_name, object_name])
+    if row.storageClass and row.storageClass == "STANDARD":
+        LOG.debug("%s last moved to STANDARD, cannot warm up.", object_path)
+        return False
+    if row.recent_access_count >= int(config['WARM_THRESHOLD_ACCESSES']):
+        LOG.info(
+            "%s accessed %s times in the last %s days, greater than %s accesses. Warming up to Standard storage.",
+            object_path, row.recent_access_count, config['WARM_THRESHOLD_DAYS'],
+            config['WARM_THRESHOLD_ACCESSES'])
+        return True
+    LOG.debug(
+        "%s accessed %s times in the last %s days, fewer than %s accesses. Will not warm.",
+        object_path, row.recent_access_count, config['WARM_THRESHOLD_DAYS'],
+        config['WARM_THRESHOLD_ACCESSES'])
+    return False
+
+
+def should_cool_down(row, config):
+    """Decide whether an object should be rewritten to a "cooler" storage class.
+
+    Arguments:
+        row {BigQuery.row} -- Row from result set.
+        config {dict} -- Configuration of this program.
+
+    Returns:
+        bool -- True if the object should be archived.
+    """
+    timedelta = datetime.now(tz=timezone.utc) - row.lastAccess
+    bucket_name, object_name = get_bucket_and_object(row.resourceName)
+    object_path = "/".join(["gs:/", bucket_name, object_name])
+    if row.storageClass and row.storageClass == config['COLD_STORAGE_CLASS']:
+        LOG.debug("%s last moved to %s, cannot cool down.", object_path,
+                  config['COLD_STORAGE_CLASS'])
+        return False
     if 'SECONDS_THRESHOLD' in config:
         # If present, SECONDS_THRESHOLD will override. Note this only works for seconds since midnight. This is only for development use.
         if timedelta.seconds >= int(config['SECONDS_THRESHOLD']):
-            LOG.info("%s last accessed %s ago, greater than %s second(s) ago",
-                     object_path, timedelta, config['SECONDS_THRESHOLD'])
+            LOG.info(
+                "%s last accessed %s ago, greater than %s second(s) ago, will cool down.",
+                object_path, timedelta, config['SECONDS_THRESHOLD'])
             return True
-        LOG.info("%s last accessed %s ago, less than %s second(s) ago",
-                 object_path, timedelta, config['SECONDS_THRESHOLD'])
+        LOG.debug(
+            "%s last accessed %s ago, less than %s second(s) ago. will not cool down.",
+            object_path, timedelta, config['SECONDS_THRESHOLD'])
         return False
     else:
-        if timedelta.days >= int(config['DAYS_THRESHOLD']):
-            LOG.info("%s last accessed %s ago, greater than %s days(s) ago",
-                     object_path, timedelta, config['DAYS_THRESHOLD'])
+        if timedelta.days >= int(config['COLD_THRESHOLD_DAYS']):
+            LOG.info(
+                "%s last accessed %s ago, greater than %s days(s) ago, will cool down.",
+                object_path, timedelta, config['COLD_THRESHOLD_DAYS'])
             return True
-        LOG.info("%s last accessed %s ago, less than %s days(s) ago",
-                 object_path, timedelta, config['DAYS_THRESHOLD'])
+        LOG.debug(
+            "%s last accessed %s ago, less than %s days(s) ago, will not cool down.",
+            object_path, timedelta, config['COLD_THRESHOLD_DAYS'])
         return False
 
 
-def archive_object(resourceName, bucket_name, object_name, object_path, config,
-                   moved_output, excluded_output):
+def rewrite_object(row, config, storage_class, moved_output, excluded_output):
     """Rewrites an object to the archive storage class and stores record of it.
 
     Arguments:
-        resourceName {string} -- The resource name for the object as shown in the
-        audit log (protopayload_auditlog.resourceName).
-        bucket_name {string} -- The name of the bucket where the object resides.
-        object_name {string} -- The name of the object within the bucket.
-        object_path {string} -- The full gs:// path to the object.
+        row {BigQuery.row} -- Row from result set.
+        config {dict} -- Configuration of this program.
+        moved_output {helpers.BigQueryOutput} -- Output for records of moved objects.
+        exluded_output {helpers.BigQueryOutput} -- Output for records of not found/excluded objects.
 
     Returns:
         string -- Human-readable output describing the operations undertaken.
     """
+    bucket_name, object_name = get_bucket_and_object(row.resourceName)
+    object_path = "/".join(["gs:/", bucket_name, object_name])
     dry_run = config["DRY_RUN"]
     try:
         gcs = get_gcs_client(config)
         bucket = storage.bucket.Bucket(gcs, name=bucket_name)
         blob = storage.blob.Blob(object_name, bucket)
-        object_info = {
-            "resourceName": resourceName,
-            "size": blob.size,
-            "archiveTimestamp": str(datetime.now(timezone.utc))
-        }
+        current_create_time = None
+        if "RECORD_ORIGINAL_CREATE_TIME" in config:
+            LOG.debug("Getting original blob info.")
+            blob_info = bucket.get_blob(object_name)
+            current_create_time = blob_info.time_created if blob_info else None
         LOG.info("%s%s rewriting to: %s", "DRY RUN: " if dry_run else "",
-                 object_path, config['NEW_STORAGE_CLASS'])
+                 object_path, storage_class)
         if not dry_run:
-            blob.update_storage_class(config['NEW_STORAGE_CLASS'], gcs)
-            LOG.info("%s rewrite to %s complete.\n%s", object_path,
-                     config['NEW_STORAGE_CLASS'], object_info)
+            blob.update_storage_class(storage_class, gcs)
+            LOG.debug("%s rewrite to %s complete.", object_path, storage_class)
+        object_info = {
+            "storageClass": storage_class,
+            "resourceName": row.resourceName,
+            "size": blob.size,
+            "moveTimestamp": str(datetime.now(timezone.utc))
+        }
+        if current_create_time:
+            object_info.update(
+                {"blobCreatedTimeWhenMoved": str(current_create_time)})
         moved_output.put(object_info)
-        LOG.debug("%s object storage class status queued for write to BQ.",
-                  object_path)
+        LOG.info("%s new storage class queued for write to BQ: \n%s",
+                 object_path, object_info)
     except NotFound:
         LOG.info(
             "%s skipped! This object wasn't found. Adding to excluded objects list so it will no longer be considered.",
             object_path)
-        excluded_output.put({"resourceName": resourceName})
+        excluded_output.put({"resourceName": row.resourceName})
 
 
 def evaluate_objects(config):
@@ -203,12 +285,12 @@ def evaluate_objects(config):
             row = work_queue.get()
             if not row:
                 break
-            timedelta = datetime.now(tz=timezone.utc) - row.lastAccess
-            bucket_name, object_name = get_bucket_and_object(row.resourceName)
-            object_path = "/".join(["gs:/", bucket_name, object_name])
-            if should_archive(timedelta, object_path, config):
-                archive_object(row.resourceName, bucket_name, object_name,
-                            object_path, config, moved_output, excluded_output)
+            if should_warm_up(row, config):
+                rewrite_object(row, config, 'STANDARD', moved_output,
+                               excluded_output)
+            elif should_cool_down(row, config):
+                rewrite_object(row, config, config['COLD_STORAGE_CLASS'],
+                               moved_output, excluded_output)
             work_queue.task_done()
 
     # Start all worker threads
@@ -218,12 +300,27 @@ def evaluate_objects(config):
         t.start()
         worker_threads.append(t)
 
+    # Register cleanup as shutdown hook
+    def cleanup():
+        # Flush any remaining output
+        moved_output.flush()
+        excluded_output.flush()
+        # Print statistics
+        LOG.info("%s rows read.", rows_read)
+        LOG.info(moved_output.stats())
+        LOG.info(excluded_output.stats())
+
+    register(cleanup)
+
+    rows_read = 0
     # Enqueue all work
     last_accesses = query_access_table(config)
     for row in last_accesses:
+        rows_read += 1
         work_queue.put(row)
 
     # wait for all of the row jobs to complete
+    LOG.info("All work enqueued. Waiting for last jobs to complete.")
     work_queue.join()
 
     # shutdown workers
@@ -232,18 +329,11 @@ def evaluate_objects(config):
     for t in worker_threads:
         t.join()
 
-    # Flush any remaining output
-    moved_output.flush()
-    excluded_output.flush()
-
-    # Print statistics
-    LOG.info(moved_output.stats())
-    LOG.info(excluded_output.stats())
-
 
 def find_config_file(args):
-    if args.config_file:
-        return args.config_file
+    if hasattr(args, 'config_file'):
+        if args.config_file:
+            return args.config_file
     elif getenv("SMART_ARCHIVE_CONFIG"):
         return getenv("SMART_ARCHIVE_CONFIG")
     return "./default.cfg"
@@ -259,9 +349,14 @@ def build_config():
     LOG.info("Loading config: %s", config_file)
     return load_config_file(config_file,
                             required=[
-                                'PROJECT', 'DATASET_NAME', 'DAYS_THRESHOLD',
-                                'NEW_STORAGE_CLASS', 'BQ_BATCH_WRITE_SIZE',
-                                'DAYS_BETWEEN_RUNS'
+                                'PROJECT',
+                                'DATASET_NAME',
+                                'COLD_STORAGE_CLASS',
+                                'COLD_THRESHOLD_DAYS',
+                                'WARM_THRESHOLD_DAYS',
+                                'WARM_THRESHOLD_ACCESSES',
+                                'DAYS_BETWEEN_RUNS',
+                                'BQ_BATCH_WRITE_SIZE',
                             ],
                             defaults={
                                 'LOG_LEVEL': 'INFO',
@@ -280,16 +375,17 @@ def archive_cold_objects(data, context):
         config = build_config()
         # set level at root logger
         if hasattr(logging, config.get('LOG_LEVEL')):
-            logging.getLogger("smart_archiver." + __name__).setLevel(getattr(logging, config.get('LOG_LEVEL')))
-
-        print("Log level is: {}".format(config['LOG_LEVEL']))
+            logging.getLogger("smart_archiver").setLevel(
+                getattr(logging, config.get('LOG_LEVEL')))
+        else:
+            print("Invalid log level specified: {}".format(
+                config.get('LOG_LEVEL')))
+            exit(1)
         LOG.debug("Configuration: \n %s", config)
-
-        LOG.info("Evaluating accessed objects for rewriting to %s.",
-                 config['NEW_STORAGE_CLASS'])
+        LOG.info("Evaluating accessed objects for cool down/warm up.")
         evaluate_objects(config)
 
-        LOG.info("Done.")
+        LOG.info("Running shutdown hooks and exiting normally.")
 
 
 if __name__ == '__main__':
